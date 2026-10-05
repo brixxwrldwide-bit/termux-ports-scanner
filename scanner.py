@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Termux Open Ports Scanner
-A beautiful terminal UI for scanning open ports with live animations
+Termux Open Ports Scanner - Advanced Edition
+Beautiful terminal UI with dashboard, network scanning, and export features
 """
 
 import socket
@@ -9,44 +9,128 @@ import threading
 import time
 import argparse
 import json
+import csv
+import os
 from datetime import datetime
 from queue import Queue
 from collections import defaultdict
 import signal
 import sys
-from ui import TerminalUI
-import config
+
+try:
+    from colorama import Fore, Back, Style, init
+    init(autoreset=True)
+except ImportError:
+    class Fore:
+        RED = GREEN = YELLOW = CYAN = BLUE = MAGENTA = WHITE = ''
+    class Back:
+        RED = GREEN = YELLOW = CYAN = BLUE = MAGENTA = WHITE = ''
+    class Style:
+        RESET_ALL = BRIGHT = DIM = ''
+
+COMMON_PORTS = [20, 21, 22, 23, 25, 53, 80, 110, 143, 443, 445, 465, 587, 993, 995, 1433, 3306, 3389, 5432, 5900, 8000, 8080, 8443, 8888, 9000]
+
+SERVICES = {
+    20: "FTP-DATA", 21: "FTP", 22: "SSH", 23: "TELNET", 25: "SMTP", 53: "DNS",
+    80: "HTTP", 110: "POP3", 143: "IMAP", 443: "HTTPS", 445: "SMB", 465: "SMTPS",
+    587: "SMTP", 993: "IMAPS", 995: "POP3S", 1433: "SQL Server", 3306: "MySQL",
+    3389: "RDP", 5432: "PostgreSQL", 5900: "VNC", 8000: "Alt-HTTP", 8080: "HTTP-Proxy",
+    8443: "HTTPS-Alt", 8888: "Alt-HTTP", 9000: "SonarQube", 27017: "MongoDB"
+}
+
+class Dashboard:
+    """Advanced terminal dashboard"""
+    
+    def __init__(self):
+        self.width = self.get_width()
+        self.height = self.get_height()
+    
+    def get_width(self):
+        try:
+            return os.get_terminal_size().columns
+        except:
+            return 100
+    
+    def get_height(self):
+        try:
+            return os.get_terminal_size().lines
+        except:
+            return 30
+    
+    def clear(self):
+        os.system('clear' if os.name == 'posix' else 'cls')
+    
+    def center(self, text):
+        """Center text"""
+        padding = (self.width - len(text)) // 2
+        return ' ' * padding + text
+    
+    def header(self, title, subtitle=""):
+        """Print styled header"""
+        print(f"{Fore.CYAN}{'═' * self.width}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{self.center(title)}{Style.RESET_ALL}")
+        if subtitle:
+            print(f"{Fore.YELLOW}{self.center(subtitle)}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{'═' * self.width}{Style.RESET_ALL}\n")
+    
+    def footer(self, text):
+        """Print footer"""
+        print(f"{Fore.CYAN}{'─' * self.width}{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{self.center(text)}{Style.RESET_ALL}")
+    
+    def progress_bar(self, current, total, width=40):
+        """Animated progress bar"""
+        if total == 0:
+            percent = 0
+            filled = 0
+        else:
+            percent = (current / total) * 100
+            filled = int(width * current / total)
+        
+        bar = '█' * filled + '░' * (width - filled)
+        return f"{Fore.YELLOW}[{bar}] {percent:5.1f}% ({current}/{total}){Style.RESET_ALL}"
+    
+    def info_box(self, title, lines):
+        """Print info box"""
+        print(f"{Fore.CYAN}┌─ {title}{Style.RESET_ALL}")
+        for line in lines:
+            print(f"{Fore.CYAN}│{Style.RESET_ALL} {line}")
+        print(f"{Fore.CYAN}└{Style.RESET_ALL}")
+    
+    def port_entry(self, port, service, is_open=True):
+        """Format port entry"""
+        if is_open:
+            status = f"{Fore.GREEN}●{Style.RESET_ALL}"
+            color = Fore.GREEN
+        else:
+            status = f"{Fore.RED}●{Style.RESET_ALL}"
+            color = Fore.RED
+        
+        return f"{status} {color}{str(port).ljust(6)}{Style.RESET_ALL} {service}"
+    
+    def spinner_frame(self, frame):
+        """Get spinner frame"""
+        frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
+        return frames[frame % len(frames)]
+
 
 class PortScanner:
-    """Multi-threaded port scanner"""
+    """Advanced port scanner with network scanning"""
     
-    # Common service ports
-    SERVICES = {
-        20: "FTP-DATA", 21: "FTP", 22: "SSH", 23: "TELNET",
-        25: "SMTP", 53: "DNS", 80: "HTTP", 110: "POP3",
-        143: "IMAP", 443: "HTTPS", 445: "SMB", 465: "SMTPS",
-        587: "SMTP", 993: "IMAPS", 995: "POP3S", 1433: "SQL Server",
-        3306: "MySQL", 3389: "RDP", 5432: "PostgreSQL", 5900: "VNC",
-        8000: "Alt-HTTP", 8080: "HTTP-Proxy", 8443: "HTTPS-Alt",
-        8888: "Alt-HTTP", 9000: "SonarQube", 27017: "MongoDB"
-    }
-    
-    def __init__(self, host, start_port, end_port, timeout=3, threads=200):
+    def __init__(self, host, start_port=1, end_port=1024, timeout=2, threads=200):
         self.host = host
         self.start_port = start_port
         self.end_port = end_port
         self.timeout = timeout
-        self.threads = threads
+        self.threads_count = threads
         self.open_ports = {}
-        self.scanned_ports = 0
-        self.is_paused = False
+        self.closed_ports = {}
+        self.scanned = 0
         self.is_running = True
+        self.is_paused = False
+        self.start_time = None
         self.results_queue = Queue()
-        self.ui = TerminalUI()
-        
-    def get_service_name(self, port):
-        """Get service name for port"""
-        return self.SERVICES.get(port, "Unknown")
+        self.dashboard = Dashboard()
     
     def check_port(self, port):
         """Check if port is open"""
@@ -60,12 +144,11 @@ class PortScanner:
             return False
     
     def worker(self, port_queue):
-        """Worker thread function"""
+        """Worker thread"""
         while self.is_running:
             try:
                 port = port_queue.get(timeout=1)
                 
-                # Check if paused
                 while self.is_paused and self.is_running:
                     time.sleep(0.1)
                 
@@ -74,15 +157,14 @@ class PortScanner:
                     break
                 
                 is_open = self.check_port(port)
+                service = SERVICES.get(port, "Unknown")
                 
                 if is_open:
-                    service = self.get_service_name(port)
                     self.open_ports[port] = service
-                    self.results_queue.put((port, service, True))
                 else:
-                    self.results_queue.put((port, None, False))
+                    self.closed_ports[port] = service
                 
-                self.scanned_ports += 1
+                self.scanned += 1
                 port_queue.task_done()
                 
             except:
@@ -91,190 +173,318 @@ class PortScanner:
                 except:
                     pass
     
-    def scan(self, callback=None):
-        """Start the scan"""
+    def scan(self):
+        """Start scan"""
+        self.start_time = time.time()
         port_range = self.end_port - self.start_port + 1
         port_queue = Queue()
         
-        # Fill queue with ports
         for port in range(self.start_port, self.end_port + 1):
             port_queue.put(port)
         
-        # Start worker threads
-        thread_list = []
-        for _ in range(min(self.threads, port_range)):
+        threads = []
+        for _ in range(min(self.threads_count, port_range)):
             t = threading.Thread(target=self.worker, args=(port_queue,))
             t.daemon = True
             t.start()
-            thread_list.append(t)
+            threads.append(t)
         
-        start_time = time.time()
-        last_update = time.time()
-        frame = 0
+        self.render_scan(port_range)
         
-        try:
-            while self.is_running:
-                # Check for results
-                while not self.results_queue.empty():
-                    try:
-                        port, service, is_open = self.results_queue.get_nowait()
-                        if callback and is_open:
-                            callback(port, service)
-                    except:
-                        pass
-                
-                # Update progress
-                current_time = time.time()
-                if current_time - last_update > config.REFRESH_RATE:
-                    if callback:
-                        self.ui.print_progress_bar(self.scanned_ports, port_range)
-                    last_update = current_time
-                    frame += 1
-                
-                # Check if scan is complete
-                if port_queue.empty() and self.scanned_ports >= port_range:
-                    break
-                
-                time.sleep(0.01)
-        
-        except KeyboardInterrupt:
-            self.is_running = False
-        
-        # Wait for all threads
-        for t in thread_list:
+        for t in threads:
             t.join(timeout=1)
         
-        duration = time.time() - start_time
-        return duration
+        return time.time() - self.start_time
     
-    def pause(self):
-        """Pause scanning"""
-        self.is_paused = not self.is_paused
+    def render_scan(self, total):
+        """Render scan progress"""
+        frame = 0
+        last_open_count = 0
+        
+        while self.scanned < total and self.is_running:
+            self.dashboard.clear()
+            self.dashboard.header("🔍 Open Ports Scanner", "Advanced Terminal Edition")
+            
+            # Scan info
+            print(f"{Fore.CYAN}Target Host: {Fore.GREEN}{self.host}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Port Range: {Fore.GREEN}{self.start_port}-{self.end_port}{Style.RESET_ALL}")
+            print(f"{Fore.CYAN}Threads: {Fore.GREEN}{self.threads_count}{Style.RESET_ALL}\n")
+            
+            # Progress bar
+            print(self.dashboard.progress_bar(self.scanned, total))
+            print()
+            
+            # Statistics
+            elapsed = time.time() - self.start_time
+            if elapsed > 0:
+                speed = self.scanned / elapsed
+            else:
+                speed = 0
+            
+            stats = [
+                f"Scanned: {self.scanned}/{total}",
+                f"Open Ports: {Fore.GREEN}{len(self.open_ports)}{Style.RESET_ALL}",
+                f"Speed: {Fore.YELLOW}{speed:.1f} ports/sec{Style.RESET_ALL}",
+                f"Elapsed: {Fore.CYAN}{elapsed:.1f}s{Style.RESET_ALL}"
+            ]
+            
+            self.dashboard.info_box("📊 Statistics", stats)
+            print()
+            
+            # Open ports display
+            if self.open_ports:
+                print(f"{Fore.GREEN}═══ OPEN PORTS ==={Style.RESET_ALL}")
+                for port, service in sorted(self.open_ports.items())[:8]:
+                    print(self.dashboard.port_entry(port, service, True))
+                if len(self.open_ports) > 8:
+                    print(f"{Fore.YELLOW}... and {len(self.open_ports) - 8} more{Style.RESET_ALL}")
+                print()
+            
+            # Footer
+            spinner = self.dashboard.spinner_frame(frame)
+            self.dashboard.footer(f"{spinner} Scanning... Press Ctrl+C to stop")
+            
+            frame += 1
+            time.sleep(0.15)
     
-    def stop(self):
-        """Stop scanning"""
-        self.is_running = False
-
-
-class InteractiveScannerUI:
-    """Interactive UI wrapper for scanner"""
-    
-    def __init__(self):
-        self.ui = TerminalUI()
-        self.scanner = None
-        self.current_scan_data = []
-    
-    def run_scan(self, host, start_port, end_port, threads=200, timeout=3):
-        """Run interactive scan"""
-        self.ui.clear_screen()
-        self.ui.print_header("Termux Ports Scanner", "🔍 Live Port Scanner")
-        self.ui.print_scan_info(host, start_port, end_port, threads)
+    def display_results(self):
+        """Display final results"""
+        self.dashboard.clear()
+        self.dashboard.header("🎯 Scan Results", f"Target: {self.host}")
         
-        self.scanner = PortScanner(host, start_port, end_port, timeout, threads)
+        elapsed = time.time() - self.start_time
         
-        def on_port_found(port, service):
-            self.current_scan_data.append((port, service))
-            self.ui.print_port_result(port, True, service)
+        # Summary
+        summary = [
+            f"Total Scanned: {self.scanned}",
+            f"Open Ports: {Fore.GREEN}{len(self.open_ports)}{Style.RESET_ALL}",
+            f"Duration: {Fore.CYAN}{elapsed:.2f}s{Style.RESET_ALL}",
+            f"Completed: {datetime.now().strftime('%H:%M:%S')}"
+        ]
+        self.dashboard.info_box("📈 Summary", summary)
+        print()
         
-        print(f"\n{self.ui.create_animation_frame(0)} Starting scan...\n")
-        time.sleep(0.5)
-        
-        duration = self.scanner.scan(callback=on_port_found)
-        
-        print("\n")
-        self.ui.print_summary(self.scanner.open_ports, 
-                             self.scanner.end_port - self.scanner.start_port + 1,
-                             duration)
-        
-        # Display results
-        if self.scanner.open_ports:
-            self.ui.print_open_ports_list(self.scanner.open_ports)
+        # Open ports
+        if self.open_ports:
+            print(f"{Fore.GREEN}═══ OPEN PORTS ({len(self.open_ports)}) ==={Style.RESET_ALL}")
+            for port, service in sorted(self.open_ports.items()):
+                print(self.dashboard.port_entry(port, service, True))
         else:
-            self.ui.print_warning("No open ports found")
+            print(f"{Fore.RED}No open ports found{Style.RESET_ALL}")
         
-        self.ui.print_legend()
-        
-        # Save option
-        self.offer_export()
+        print()
+        self.dashboard.footer(f"Scan completed successfully")
+
+
+class ScanExporter:
+    """Export scan results to various formats"""
     
-    def offer_export(self):
-        """Offer to export results"""
-        if not self.scanner or not self.scanner.open_ports:
-            return
-        
-        response = input(f"Export results? (y/n): ").lower()
-        if response == 'y':
-            self.export_results()
-    
-    def export_results(self):
-        """Export scan results"""
-        if not self.scanner or not self.scanner.open_ports:
-            return
-        
-        filename = f"scan_{self.scanner.host}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    @staticmethod
+    def to_txt(scanner, filename=None):
+        """Export to text file"""
+        if not filename:
+            filename = f"scan_{scanner.host}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
         
         try:
             with open(filename, 'w') as f:
-                f.write("=== Port Scan Results ===\n")
-                f.write(f"Host: {self.scanner.host}\n")
-                f.write(f"Scan Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Ports Scanned: {self.scanner.end_port - self.scanner.start_port + 1}\n")
-                f.write(f"Open Ports: {len(self.scanner.open_ports)}\n\n")
-                f.write("Open Ports:\n")
-                f.write("-" * 40 + "\n")
+                f.write("="*60 + "\n")
+                f.write("OPEN PORTS SCAN RESULTS\n")
+                f.write("="*60 + "\n\n")
+                f.write(f"Host: {scanner.host}\n")
+                f.write(f"Port Range: {scanner.start_port}-{scanner.end_port}\n")
+                f.write(f"Total Scanned: {scanner.scanned}\n")
+                f.write(f"Open Ports: {len(scanner.open_ports)}\n")
+                f.write(f"Scan Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                 
-                for port in sorted(self.scanner.open_ports.keys()):
-                    service = self.scanner.open_ports[port]
-                    f.write(f"Port {port}: {service}\n")
+                f.write("OPEN PORTS:\n")
+                f.write("-"*60 + "\n")
+                for port, service in sorted(scanner.open_ports.items()):
+                    f.write(f"Port {port:>5}: {service}\n")
             
-            self.ui.print_success(f"Results exported to {filename}")
+            return filename
         except Exception as e:
-            self.ui.print_error(f"Failed to export: {e}")
+            print(f"{Fore.RED}Export failed: {e}{Style.RESET_ALL}")
+            return None
+    
+    @staticmethod
+    def to_json(scanner, filename=None):
+        """Export to JSON file"""
+        if not filename:
+            filename = f"scan_{scanner.host}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        
+        try:
+            data = {
+                "host": scanner.host,
+                "scan_time": datetime.now().isoformat(),
+                "port_range": {"start": scanner.start_port, "end": scanner.end_port},
+                "total_scanned": scanner.scanned,
+                "open_ports": scanner.open_ports,
+                "open_port_count": len(scanner.open_ports)
+            }
+            
+            with open(filename, 'w') as f:
+                json.dump(data, f, indent=2)
+            
+            return filename
+        except Exception as e:
+            print(f"{Fore.RED}Export failed: {e}{Style.RESET_ALL}")
+            return None
+    
+    @staticmethod
+    def to_csv(scanner, filename=None):
+        """Export to CSV file"""
+        if not filename:
+            filename = f"scan_{scanner.host}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        
+        try:
+            import csv as csv_module
+            with open(filename, 'w', newline='') as f:
+                writer = csv_module.writer(f)
+                writer.writerow(['Port', 'Service', 'Status'])
+                for port, service in sorted(scanner.open_ports.items()):
+                    writer.writerow([port, service, 'OPEN'])
+            
+            return filename
+        except Exception as e:
+            print(f"{Fore.RED}Export failed: {e}{Style.RESET_ALL}")
+            return None
+
+
+class NetworkScanner:
+    """Scan local network for active hosts"""
+    
+    @staticmethod
+    def get_local_network():
+        """Get local network info"""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            
+            # Get network range (assume /24)
+            base = '.'.join(ip.split('.')[:-1])
+            return base
+        except:
+            return "192.168.1"
+    
+    @staticmethod
+    def ping_host(host, timeout=1):
+        """Check if host is reachable"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, 22))  # Try SSH port
+            sock.close()
+            return result == 0
+        except:
+            return False
+    
+    @staticmethod
+    def scan_network(base_ip, dashboard):
+        """Scan network for active hosts"""
+        active_hosts = []
+        
+        dashboard.clear()
+        dashboard.header("🌐 Network Discovery", f"Scanning {base_ip}.0/24")
+        
+        threads = []
+        results = []
+        lock = threading.Lock()
+        
+        def check_host_thread(ip):
+            if NetworkScanner.ping_host(ip, 1):
+                with lock:
+                    results.append(ip)
+                    print(f"{Fore.GREEN}✓{Style.RESET_ALL} {ip} is reachable")
+        
+        print(f"\nScanning {base_ip}.1-{base_ip}.254...\n")
+        
+        for i in range(1, 255):
+            host = f"{base_ip}.{i}"
+            t = threading.Thread(target=check_host_thread, args=(host,))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+        
+        for t in threads:
+            t.join(timeout=5)
+        
+        return results
 
 
 def main():
-    """Main entry point"""
     parser = argparse.ArgumentParser(
-        description='Termux Open Ports Scanner - Beautiful terminal UI for port scanning',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog='''
-Examples:
-  python3 scanner.py                           # Scan localhost ports 1-1024
-  python3 scanner.py --host 192.168.1.1       # Scan specific host
-  python3 scanner.py --host 8.8.8.8 --start 1 --end 100  # Custom range
-  python3 scanner.py --common                  # Scan common ports only
-        '''
+        description='Termux Advanced Ports Scanner',
+        epilog='''Examples:
+  python3 scanner.py
+  python3 scanner.py --host 192.168.1.1
+  python3 scanner.py --common
+  python3 scanner.py --network
+  python3 scanner.py --export json
+        ''',
+        formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
-    parser.add_argument('--host', default='127.0.0.1',
-                       help='Target host to scan (default: 127.0.0.1)')
-    parser.add_argument('--start', type=int, default=1,
-                       help='Start port (default: 1)')
-    parser.add_argument('--end', type=int, default=1024,
-                       help='End port (default: 1024)')
-    parser.add_argument('--timeout', type=float, default=3,
-                       help='Connection timeout in seconds (default: 3)')
-    parser.add_argument('--threads', type=int, default=200,
-                       help='Number of threads (default: 200)')
-    parser.add_argument('--common', action='store_true',
-                       help='Scan only common ports')
+    parser.add_argument('--host', default='127.0.0.1', help='Target host')
+    parser.add_argument('--start', type=int, default=1, help='Start port')
+    parser.add_argument('--end', type=int, default=1024, help='End port')
+    parser.add_argument('--timeout', type=float, default=2, help='Socket timeout')
+    parser.add_argument('--threads', type=int, default=200, help='Thread count')
+    parser.add_argument('--common', action='store_true', help='Scan common ports only')
+    parser.add_argument('--network', action='store_true', help='Network discovery mode')
+    parser.add_argument('--export', choices=['txt', 'json', 'csv'], help='Export format')
     
     args = parser.parse_args()
     
-    # Handle common ports mode
     if args.common:
-        args.start = min(config.COMMON_PORTS)
-        args.end = max(config.COMMON_PORTS)
+        args.start = min(COMMON_PORTS)
+        args.end = max(COMMON_PORTS)
     
     try:
-        scanner_ui = InteractiveScannerUI()
-        scanner_ui.run_scan(args.host, args.start, args.end, args.threads, args.timeout)
+        if args.network:
+            # Network discovery mode
+            dashboard = Dashboard()
+            base = NetworkScanner.get_local_network()
+            hosts = NetworkScanner.scan_network(base, dashboard)
+            
+            if hosts:
+                print(f"\n{Fore.GREEN}Found {len(hosts)} active hosts:{Style.RESET_ALL}")
+                for host in sorted(hosts):
+                    print(f"  {host}")
+        else:
+            # Port scanning mode
+            scanner = PortScanner(
+                args.host,
+                args.start,
+                args.end,
+                args.timeout,
+                args.threads
+            )
+            
+            scanner.scan()
+            scanner.display_results()
+            
+            # Export option
+            if args.export or input(f"\n{Fore.CYAN}Export results? (y/n): {Style.RESET_ALL}").lower() == 'y':
+                export_fmt = args.export or input(f"{Fore.CYAN}Format (txt/json/csv): {Style.RESET_ALL}")
+                
+                exporter = ScanExporter()
+                if export_fmt == 'json':
+                    filename = exporter.to_json(scanner)
+                elif export_fmt == 'csv':
+                    filename = exporter.to_csv(scanner)
+                else:
+                    filename = exporter.to_txt(scanner)
+                
+                if filename:
+                    print(f"\n{Fore.GREEN}✓ Saved to {filename}{Style.RESET_ALL}")
     
     except KeyboardInterrupt:
-        print(f"\n\n{scanner_ui.ui.ui.create_animation_frame(0) if 'scanner_ui' in locals() else ''} Scan interrupted by user")
+        print(f"\n{Fore.RED}Scan interrupted{Style.RESET_ALL}")
         sys.exit(0)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"{Fore.RED}Error: {e}{Style.RESET_ALL}")
         sys.exit(1)
 
 
